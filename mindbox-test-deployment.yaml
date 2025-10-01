@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mindbox-test
+  labels:
+    app: mindbox-test
+spec:
+  # Минимальное количество реплик.
+  # Устанавливаю 1, чтобы ночью минимизировать расход ресурсов
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mindbox-test
+  template:
+    metadata:
+      labels:
+        app: mindbox-test
+    spec:
+      # TopologySpreadConstraints позволяют равномерно распределять поды
+      # делаю по доступным зонам для отказоустойчивости
+      # Это нужно для работы в мультизональном кластере ( как у нас в условии )
+      topologySpreadConstraints:
+        - maxSkew: 1 # Разница в количестве подов между зонами ≤ 1
+          topologyKey: topology.kubernetes.io/zone # ключ для зоны
+          whenUnsatisfiable: ScheduleAnyway # если невозможно распределить, то всё равно запускаем под
+          labelSelector:
+            matchLabels:
+              app: mindbox-test
+      containers:
+        - name: mindbox-test-container
+          image: your-repo/mindbox-test:latest
+          ports:
+            - containerPort: 8080 # выбрал стандратный порт
+          resources:
+            requests:
+              cpu: "100m"      #  это базовое потребление после старта ( по условию )
+              memory: "128Mi"  # Постоянное потребление памяти ( по условию )
+            limits:
+              cpu: "500m"      # Допустим высокий CPU на старте (до 0.5 CPU)
+              memory: "256Mi"  # Резерв на случай пикового использования
+          # startupProbe, если  вдруг будет долгий старт, чтобы под не "убился" до полной инициализации
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5    # Ждём 5 секунд после старта контейнера
+            periodSeconds: 10         # Проверяем каждые 10 секунд
+            failureThreshold: 6       # После 6 неудачных проверок ( около минуты ) под считается неуспешным
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10   # Ждём 10 секунд после старта, чтобы под успел инициализироваться
+            periodSeconds: 5          # Проверяем каждые 5 секунд
+            failureThreshold: 3       # 3 неудачные проверки - убираем под
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mindbox-test-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mindbox-test
+  # Минимум и максимум подов
+  # minReplicas=1, чтобы ночью экономить ресурсы
+  # maxReplicas=4, из условия по нагрузочным тестам 4 пода достаточно для пиков
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  # HPA будет автоматически масштабировать приложение, основываясь на расход cpu
+  # В нашем случае,HPA позволяет поднять количество подов в пик и уменьшить ночью
+---
+# Если хотим контролировать скейлинг ночью, то нужно использовать CronJob
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hpa-night-scaler
+spec:
+  schedule: "0 2 * * *" # Каждый день в 2 часа ночи
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: scaler
+              image: bitnami/kubectl # Минималистичный образ с kubectl
+              command:
+                - /bin/sh
+                - -c
+                - kubectl scale deployment mindbox-test --replicas=1
+              env:
+                # Если нужно, добавляем переменные окружения для доступа к кластеру
+                - name: KUBECONFIG
+                  value: /path/to/kubeconfig
+          restartPolicy: OnFailure
